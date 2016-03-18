@@ -49,19 +49,32 @@ func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 	conn, err := dialer.Dial("tcp", upstream)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to dial upstream [%s]: %s\n", upstream, err)
+		m.Rcode = dns.RcodeServerFailure
+		err = w.WriteMsg(m)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to write response: %s\n", err)
+		}
 		return
 	}
 	co := &dns.Conn{Conn: conn}
-	co.WriteMsg(r)
-	rr, err := co.ReadMsg()
+	defer conn.Close()
+	err = co.WriteMsg(r)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to send query to %s: %s\n", upstream, err)
 		m.Rcode = dns.RcodeServerFailure
+		err = w.WriteMsg(m)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to write response: %s\n", err)
+		}
+		return
+	}
+	rr, err := co.ReadMsg()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read response from %s: %s\n", upstream, err)
+		m.Rcode = dns.RcodeServerFailure
 	} else {
 		m = rr
-		co.Close()
 	}
-	conn.Close()
 	err = w.WriteMsg(m)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to write response: %s\n", err)
