@@ -12,7 +12,6 @@ import (
 )
 
 type tdns struct {
-	c         *dns.Client
 	dialer    *net.Dialer
 	upstreams []string
 	proxy     string
@@ -27,7 +26,7 @@ func randomString() string {
 	return fmt.Sprintf("%X", b)
 }
 
-func (t *tdns) newDialer() {
+func (t *tdns) newDialer() proxy.Dialer {
 	randStr := randomString()
 	p, err := proxy.SOCKS5(
 		"tcp",
@@ -38,28 +37,35 @@ func (t *tdns) newDialer() {
 	if err != nil {
 		panic(err)
 	}
-	t.c.Dialer = p
+	return p
 }
 
 func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 	fmt.Println("query")
-	t.newDialer()
+	upstream := t.upstreams[0]
 	m := new(dns.Msg)
 	m.SetReply(r)
-	upstream := t.upstreams[0]
-	rr, _, err := t.c.Exchange(r, upstream)
+	dialer := t.newDialer()
+	conn, err := dialer.Dial("tcp", upstream)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to dial upstream [%s]: %s\n", upstream, err)
+		return
+	}
+	co := &dns.Conn{Conn: conn}
+	co.WriteMsg(r)
+	rr, err := co.ReadMsg()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to send query to %s: %s\n", upstream, err)
-		m.Response = true
 		m.Rcode = dns.RcodeServerFailure
 	} else {
 		m = rr
+		co.Close()
 	}
+	conn.Close()
 	err = w.WriteMsg(m)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to write response: %s\n", err)
 	}
-	return
 }
 
 func (t *tdns) serve(addr, network string, rTimeout, wTimeout time.Duration) {
@@ -78,11 +84,9 @@ func (t *tdns) serve(addr, network string, rTimeout, wTimeout time.Duration) {
 
 func main() {
 	t := &tdns{
-		c:         new(dns.Client),
 		dialer:    &net.Dialer{Timeout: 10 * time.Second},
 		proxy:     "127.0.0.1:9150",
 		upstreams: []string{"8.8.8.8:53"},
 	}
-	t.c.Net = "tcp"
 	t.serve("127.0.0.1:9053", "tcp", time.Millisecond, time.Millisecond)
 }
