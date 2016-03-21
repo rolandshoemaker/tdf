@@ -3,8 +3,10 @@ package main
 import (
 	"crypto/rand"
 	"fmt"
+	mrand "math/rand"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/rolandshoemaker/dns"
@@ -14,6 +16,7 @@ import (
 type tdns struct {
 	dialer    *net.Dialer
 	upstreams []string
+	paths     int
 	proxy     string
 }
 
@@ -40,44 +43,76 @@ func (t *tdns) newDialer() proxy.Dialer {
 	return p
 }
 
-func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
-	fmt.Println("query")
-	upstream := t.upstreams[0]
-	m := new(dns.Msg)
-	m.SetReply(r)
+func (t *tdns) forward(r *dns.Msg, upstream string) (*dns.Msg, error) {
 	dialer := t.newDialer()
 	conn, err := dialer.Dial("tcp", upstream)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to dial upstream [%s]: %s\n", upstream, err)
-		m.Rcode = dns.RcodeServerFailure
-		err = w.WriteMsg(m)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to write response: %s\n", err)
-		}
-		return
+		return nil, fmt.Errorf("failed to dial upstream [%s]: %s", upstream, err)
 	}
 	co := &dns.Conn{Conn: conn}
 	defer conn.Close()
 	err = co.WriteMsg(r)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to send query to %s: %s\n", upstream, err)
-		m.Rcode = dns.RcodeServerFailure
-		err = w.WriteMsg(m)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to write response: %s\n", err)
-		}
-		return
+		return nil, fmt.Errorf("failed to send query to %s: %s", upstream, err)
 	}
 	rr, err := co.ReadMsg()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read response from %s: %s\n", upstream, err)
-		m.Rcode = dns.RcodeServerFailure
-	} else {
-		m = rr
+		return nil, fmt.Errorf("failed to read message: %s", err)
 	}
-	err = w.WriteMsg(m)
+	return rr, nil
+}
+
+func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
+	upstream := t.upstreams[mrand.Intn(len(t.upstreams))]
+	results := make([]*dns.Msg, t.paths)
+	wg := new(sync.WaitGroup)
+	for i := 0; i < t.paths; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			response, err := t.forward(r, upstream)
+			if err != nil {
+				// something
+				fmt.Fprintf(os.Stderr, "Failed to forward query to '%s': %s\n", upstream, err)
+			}
+			fmt.Println(i)
+			results[i] = response
+		}(i)
+	}
+	wg.Wait()
+
+	// merge results
+	ret := new(dns.Msg)
+	ret.SetReply(r)
+	rcodes := make(map[int]int)
+	answer := []dns.RR{}
+	ns := []dns.RR{}
+	extra := []dns.RR{}
+	for _, result := range results {
+		if result == nil {
+			// bad
+			continue
+		}
+		rcodes[result.Rcode]++
+		answer = append(answer, result.Answer...)
+		ns = append(ns, result.Ns...)
+		extra = append(extra, result.Extra...)
+	}
+	li := 0
+	for i, v := range rcodes {
+		if v > rcodes[li] {
+			li = i
+		}
+	}
+	ret.Rcode = rcodes[li]
+	if ret.Rcode == dns.RcodeSuccess {
+		ret.Answer = dns.Dedup(answer, nil)
+		ret.Ns = dns.Dedup(ns, nil)
+		ret.Extra = dns.Dedup(extra, nil)
+	}
+	err := w.WriteMsg(ret)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to write response: %s\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to write response to query: %s\n", err)
 	}
 }
 
@@ -99,7 +134,8 @@ func main() {
 	t := &tdns{
 		dialer:    &net.Dialer{Timeout: 10 * time.Second},
 		proxy:     "127.0.0.1:9150",
-		upstreams: []string{"8.8.8.8:53"},
+		upstreams: []string{"8.8.8.8:53", "8.8.4.4:53"},
+		paths:     3,
 	}
 	t.serve("127.0.0.1:9053", "tcp", time.Millisecond, time.Millisecond)
 }
