@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"math"
 	mrand "math/rand"
 	"net"
 	"os"
@@ -16,13 +17,6 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-type tdns struct {
-	dialer    *net.Dialer
-	upstreams []string
-	paths     int
-	proxy     string
-}
-
 func randomString() string {
 	b := make([]byte, 16)
 	_, err := rand.Read(b)
@@ -30,6 +24,22 @@ func randomString() string {
 		panic(err)
 	}
 	return fmt.Sprintf("%X", b)
+}
+
+func majority(total int) int {
+	if total == 1 {
+		return 1
+	}
+	cm := float64(total) * (2.0 / 3.0) // require two thirds majority
+	return int(math.Floor(cm))
+}
+
+type tdns struct {
+	dialer    *net.Dialer
+	upstreams []string
+	paths     int
+	majority  int
+	proxy     string
 }
 
 func (t *tdns) newDialer() proxy.Dialer {
@@ -84,7 +94,6 @@ func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 			defer wg.Done()
 			response, err := t.forward(r, upstream)
 			if err != nil {
-				// something
 				fmt.Fprintf(os.Stderr, "Failed to forward query: %s\n", err)
 			}
 			results[i] = response
@@ -99,15 +108,23 @@ func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 	answer := []dns.RR{}
 	ns := []dns.RR{}
 	extra := []dns.RR{}
+	failed := 0
 	for _, result := range results {
 		if result == nil {
-			// bad
+			failed++
 			continue
 		}
 		rcodes[result.Rcode]++
 		answer = append(answer, result.Answer...)
 		ns = append(ns, result.Ns...)
 		extra = append(extra, result.Extra...)
+	}
+	if failed > t.majority {
+		ret.Rcode = dns.RcodeServerFailure
+		err := w.WriteMsg(ret)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to write response to query: %s\n", err)
+		}
 	}
 	li := 0
 	for i, v := range rcodes {
@@ -142,10 +159,13 @@ func (t *tdns) serve(addr, network string, rTimeout, wTimeout time.Duration) {
 }
 
 type config struct {
-	TorProxy          string
-	UpstreamResolvers []string
-	PathsPerQuery     int
-	DNSAddr           string
+	TorProxy          string   `yaml:"tor-proxy"`
+	UpstreamResolvers []string `yaml:"upstream-resolvers"`
+	PathsPerQuery     int      `yaml:"paths-per-query"`
+	DNSAddr           string   `yaml:"dns-addr"`
+	DNSReadTimeout    string   `yaml:"dns-read-timeout"`
+	DNSWriteTimeout   string   `yaml:"dns-write-timeout"`
+	DNSNetwork        string   `yaml:"dns-network"`
 }
 
 func main() {
@@ -165,9 +185,29 @@ func main() {
 
 	t := &tdns{
 		dialer:    &net.Dialer{Timeout: 10 * time.Second},
-		proxy:     "127.0.0.1:9150",
-		upstreams: []string{"8.8.8.8:53", "8.8.4.4:53"},
-		paths:     5,
+		proxy:     c.TorProxy,
+		upstreams: c.UpstreamResolvers,
+		paths:     c.PathsPerQuery,
+		majority:  majority(c.PathsPerQuery),
 	}
-	t.serve("127.0.0.1:9053", "tcp", time.Millisecond, time.Millisecond)
+	dnsWTimeout := time.Millisecond
+	if c.DNSWriteTimeout != "" {
+		dnsWTimeout, err = time.ParseDuration(c.DNSWriteTimeout)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to parse dns-write-timeout: %s\n", err)
+			os.Exit(1)
+		}
+	}
+	dnsRTimeout := time.Millisecond
+	if c.DNSReadTimeout != "" {
+		dnsRTimeout, err = time.ParseDuration(c.DNSReadTimeout)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to parse dns-read-timeout: %s\n", err)
+			os.Exit(1)
+		}
+	}
+	if c.DNSNetwork == "" {
+		c.DNSNetwork = "udp"
+	}
+	t.serve(c.DNSAddr, c.DNSNetwork, dnsRTimeout, dnsWTimeout)
 }
