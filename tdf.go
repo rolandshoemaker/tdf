@@ -2,15 +2,18 @@ package main
 
 import (
 	"crypto/rand"
+	"flag"
 	"fmt"
+	"io/ioutil"
 	mrand "math/rand"
 	"net"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/rolandshoemaker/dns"
+	"github.com/miekg/dns"
 	"golang.org/x/net/proxy"
+	"gopkg.in/yaml.v2"
 )
 
 type tdns struct {
@@ -64,6 +67,15 @@ func (t *tdns) forward(r *dns.Msg, upstream string) (*dns.Msg, error) {
 
 func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 	upstream := t.upstreams[mrand.Intn(len(t.upstreams))]
+	fmt.Fprintf(
+		os.Stdout,
+		"Query from %s for %s %s %s forwarding to %s\n",
+		w.RemoteAddr(),
+		dns.ClassToString[r.Question[0].Qclass],
+		dns.TypeToString[r.Question[0].Qtype],
+		r.Question[0].Name,
+		upstream,
+	)
 	results := make([]*dns.Msg, t.paths)
 	wg := new(sync.WaitGroup)
 	for i := 0; i < t.paths; i++ {
@@ -73,9 +85,8 @@ func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 			response, err := t.forward(r, upstream)
 			if err != nil {
 				// something
-				fmt.Fprintf(os.Stderr, "Failed to forward query to '%s': %s\n", upstream, err)
+				fmt.Fprintf(os.Stderr, "Failed to forward query: %s\n", err)
 			}
-			fmt.Println(i)
 			results[i] = response
 		}(i)
 	}
@@ -104,7 +115,7 @@ func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 			li = i
 		}
 	}
-	ret.Rcode = rcodes[li]
+	ret.Rcode = li
 	if ret.Rcode == dns.RcodeSuccess {
 		ret.Answer = dns.Dedup(answer, nil)
 		ret.Ns = dns.Dedup(ns, nil)
@@ -130,12 +141,33 @@ func (t *tdns) serve(addr, network string, rTimeout, wTimeout time.Duration) {
 	}
 }
 
+type config struct {
+	TorProxy          string
+	UpstreamResolvers []string
+	PathsPerQuery     int
+	DNSAddr           string
+}
+
 func main() {
+	configPath := flag.String("config", "", "Path to configuration file")
+	flag.Parse()
+	configBytes, err := ioutil.ReadFile(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read config from '%s': %s", *configPath, err)
+		os.Exit(1)
+	}
+	var c config
+	err = yaml.Unmarshal(configBytes, &c)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to parse config from '%s': %s", *configPath, err)
+		os.Exit(1)
+	}
+
 	t := &tdns{
 		dialer:    &net.Dialer{Timeout: 10 * time.Second},
 		proxy:     "127.0.0.1:9150",
 		upstreams: []string{"8.8.8.8:53", "8.8.4.4:53"},
-		paths:     3,
+		paths:     5,
 	}
 	t.serve("127.0.0.1:9053", "tcp", time.Millisecond, time.Millisecond)
 }
