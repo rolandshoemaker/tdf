@@ -76,10 +76,16 @@ func (t *tdns) forward(r *dns.Msg, upstream string) (*dns.Msg, error) {
 }
 
 func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
+	id := make([]byte, 4)
+	_, err := rand.Read(id)
+	if err != nil {
+		panic(err)
+	}
 	upstream := t.upstreams[mrand.Intn(len(t.upstreams))]
 	fmt.Fprintf(
 		os.Stdout,
-		"Query from %s for %s %s %s forwarding to %s\n",
+		"[%X] Query from %s for %s %s %s forwarding to %s\n",
+		id,
 		w.RemoteAddr(),
 		dns.ClassToString[r.Question[0].Qclass],
 		dns.TypeToString[r.Question[0].Qtype],
@@ -94,7 +100,7 @@ func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 			defer wg.Done()
 			response, err := t.forward(r, upstream)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to forward query: %s\n", err)
+				fmt.Fprintf(os.Stderr, "[%X] Forwarding failed: %s\n", id, err)
 			}
 			results[i] = response
 		}(i)
@@ -123,7 +129,7 @@ func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 		ret.Rcode = dns.RcodeServerFailure
 		err := w.WriteMsg(ret)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to write response to query: %s\n", err)
+			fmt.Fprintf(os.Stderr, "[%X] Failed to write response to query: %s\n", id, err)
 		}
 	}
 	li := 0
@@ -138,9 +144,9 @@ func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 		ret.Ns = dns.Dedup(ns, nil)
 		ret.Extra = dns.Dedup(extra, nil)
 	}
-	err := w.WriteMsg(ret)
+	err = w.WriteMsg(ret)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to write response to query: %s\n", err)
+		fmt.Fprintf(os.Stderr, "[%X] Failed to write response to query: %s\n", id, err)
 	}
 }
 
@@ -152,6 +158,7 @@ func (t *tdns) serve(addr, network string, rTimeout, wTimeout time.Duration) {
 		WriteTimeout: wTimeout,
 	}
 	dns.HandleFunc(".", t.dnsHandler)
+	fmt.Fprintf(os.Stdout, "Listening on %s/%s\n", addr, network)
 	err := dnsServer.ListenAndServe()
 	if err != nil {
 		panic(err)
