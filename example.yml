@@ -1,6 +1,6 @@
 tor-proxy: 127.0.0.1:9050
 dns-addr: 127.0.0.1:9053
-dns-network: tcp
+dns-network: udp
 paths-per-query: 3
 upstream-resolvers:
   - 8.8.8.8:53

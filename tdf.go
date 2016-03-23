@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -26,11 +28,13 @@ func randomString() string {
 	return fmt.Sprintf("%X", b)
 }
 
+var majorityDef = 2.0 / 3.0
+
 func majority(total int) int {
 	if total == 1 {
 		return 1
 	}
-	cm := float64(total) * (2.0 / 3.0) // require two thirds majority
+	cm := float64(total) * majorityDef
 	return int(math.Floor(cm))
 }
 
@@ -40,6 +44,7 @@ type tdns struct {
 	paths     int
 	majority  int
 	proxy     string
+	combiner  func([]*dns.Msg) (*dns.Msg, error)
 }
 
 func (t *tdns) newDialer() proxy.Dialer {
@@ -84,7 +89,7 @@ func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 	upstream := t.upstreams[mrand.Intn(len(t.upstreams))]
 	fmt.Fprintf(
 		os.Stdout,
-		"[%X] Query from %s for %s %s %s forwarding to %s\n",
+		"[%X] Query from %s for '%s' [%s %s] forwarding to %s\n",
 		id,
 		w.RemoteAddr(),
 		dns.ClassToString[r.Question[0].Qclass],
@@ -107,30 +112,45 @@ func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 	}
 	wg.Wait()
 
-	// merge results
-	ret := new(dns.Msg)
+	ret, err := t.combiner(results)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[%X] response check failed: %s\n", id, err)
+		ret := new(dns.Msg)
+		ret.SetReply(r)
+		ret.Rcode = dns.RcodeServerFailure
+		err = w.WriteMsg(ret)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[%X] Failed to write response to query: %s\n", id, err)
+		}
+		return
+	}
 	ret.SetReply(r)
+
+	err = w.WriteMsg(ret)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[%X] Failed to write response to query: %s\n", id, err)
+	}
+}
+
+func (t *tdns) mergeCheck(msgs []*dns.Msg) (*dns.Msg, error) {
+	ret := new(dns.Msg)
 	rcodes := make(map[int]int)
 	answer := []dns.RR{}
 	ns := []dns.RR{}
 	extra := []dns.RR{}
 	failed := 0
-	for _, result := range results {
-		if result == nil {
+	for _, m := range msgs {
+		if m == nil {
 			failed++
 			continue
 		}
-		rcodes[result.Rcode]++
-		answer = append(answer, result.Answer...)
-		ns = append(ns, result.Ns...)
-		extra = append(extra, result.Extra...)
+		rcodes[m.Rcode]++
+		answer = append(answer, m.Answer...)
+		ns = append(ns, m.Ns...)
+		extra = append(extra, m.Extra...)
 	}
 	if failed > t.majority {
-		ret.Rcode = dns.RcodeServerFailure
-		err := w.WriteMsg(ret)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[%X] Failed to write response to query: %s\n", id, err)
-		}
+		return nil, fmt.Errorf("%d queries failed or timed out (%d required to continue)", failed, t.majority)
 	}
 	li := 0
 	for i, v := range rcodes {
@@ -144,10 +164,33 @@ func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 		ret.Ns = dns.Dedup(ns, nil)
 		ret.Extra = dns.Dedup(extra, nil)
 	}
-	err = w.WriteMsg(ret)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[%X] Failed to write response to query: %s\n", id, err)
+	return ret, nil
+}
+
+func (t *tdns) strictCheck(msgs []*dns.Msg) (*dns.Msg, error) {
+	failed := 0
+	var firstPacked []byte
+	for _, m := range msgs {
+		if m == nil {
+			failed++
+			continue
+		}
+		packed, err := m.Pack()
+		if err != nil {
+			return nil, err
+		}
+		if firstPacked == nil {
+			firstPacked = packed
+		} else {
+			if bytes.Compare(firstPacked, packed) != 0 {
+				return nil, errors.New("returned response doesn't match others")
+			}
+		}
 	}
+	if failed > t.majority {
+		return nil, fmt.Errorf("%d queries failed or timed out (%d required to continue)", failed, t.majority)
+	}
+	return msgs[0], nil
 }
 
 func (t *tdns) serve(addr, network string, rTimeout, wTimeout time.Duration) {
@@ -166,13 +209,15 @@ func (t *tdns) serve(addr, network string, rTimeout, wTimeout time.Duration) {
 }
 
 type config struct {
-	TorProxy          string   `yaml:"tor-proxy"`
-	UpstreamResolvers []string `yaml:"upstream-resolvers"`
-	PathsPerQuery     int      `yaml:"paths-per-query"`
-	DNSAddr           string   `yaml:"dns-addr"`
-	DNSReadTimeout    string   `yaml:"dns-read-timeout"`
-	DNSWriteTimeout   string   `yaml:"dns-write-timeout"`
-	DNSNetwork        string   `yaml:"dns-network"`
+	TorProxy           string   `yaml:"tor-proxy"`
+	UpstreamResolvers  []string `yaml:"upstream-resolvers"`
+	PathsPerQuery      int      `yaml:"paths-per-query"`
+	DNSAddr            string   `yaml:"dns-addr"`
+	DNSReadTimeout     string   `yaml:"dns-read-timeout"`
+	DNSWriteTimeout    string   `yaml:"dns-write-timeout"`
+	DNSNetwork         string   `yaml:"dns-network"`
+	MajorityDefinition float64  `yaml:"majority-definition"`
+	Mode               string   `yaml:"mode"`
 }
 
 func main() {
@@ -190,12 +235,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	if c.MajorityDefinition > 0 {
+		majorityDef = c.MajorityDefinition
+	}
+
 	t := &tdns{
 		dialer:    &net.Dialer{Timeout: 10 * time.Second},
 		proxy:     c.TorProxy,
 		upstreams: c.UpstreamResolvers,
 		paths:     c.PathsPerQuery,
 		majority:  majority(c.PathsPerQuery),
+	}
+	switch c.Mode {
+	case "", "strict":
+		t.combiner = t.strictCheck
+	case "merge":
+		t.combiner = t.mergeCheck
+	default:
+		fmt.Fprintln(os.Stderr, "mode must be one of either 'strict' or 'merge'")
+		os.Exit(1)
 	}
 	dnsWTimeout := time.Millisecond
 	if c.DNSWriteTimeout != "" {
