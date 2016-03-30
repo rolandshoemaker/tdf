@@ -1,6 +1,9 @@
+forwarding-mode: tor
 tor-proxy: 127.0.0.1:9050
+dns-mode: strict
 dns-addr: 127.0.0.1:9053
-dns-network: udp
+dns-listen-network: udp
+dns-query-network: tcp
 paths-per-query: 3
 upstream-resolvers:
   - 8.8.8.8:53

@@ -39,21 +39,26 @@ func majority(total int) int {
 }
 
 type tdns struct {
-	dialer    *net.Dialer
+	dialerFunc   func() proxy.Dialer
+	stdDialer    *net.Dialer
+	paths        int
+	majority     int
+	combiner     func([]*dns.Msg) (*dns.Msg, error)
+	dnsQueryMode string
+
 	upstreams []string
-	paths     int
-	majority  int
-	proxy     string
-	combiner  func([]*dns.Msg) (*dns.Msg, error)
+	torProxy  string
+
+	vpnAddrs []net.Addr
 }
 
-func (t *tdns) newDialer() proxy.Dialer {
+func (t *tdns) torDialer() proxy.Dialer {
 	randStr := randomString()
 	p, err := proxy.SOCKS5(
 		"tcp",
-		t.proxy,
+		t.torProxy,
 		&proxy.Auth{User: randStr, Password: randStr}, // required to force the creation of a new circuit per query
-		t.dialer,
+		t.stdDialer,
 	)
 	if err != nil {
 		panic(err)
@@ -61,9 +66,16 @@ func (t *tdns) newDialer() proxy.Dialer {
 	return p
 }
 
+func (t *tdns) vpnDialer() proxy.Dialer {
+	var d *net.Dialer
+	*d = *t.stdDialer
+	d.LocalAddr = t.vpnAddrs[mrand.Intn(len(t.vpnAddrs))]
+	return d
+}
+
 func (t *tdns) forward(r *dns.Msg, upstream string) (*dns.Msg, error) {
-	dialer := t.newDialer()
-	conn, err := dialer.Dial("tcp", upstream)
+	dialer := t.dialerFunc()
+	conn, err := dialer.Dial(t.dnsQueryMode, upstream)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial upstream [%s]: %s", upstream, err)
 	}
@@ -210,14 +222,17 @@ func (t *tdns) serve(addr, network string, rTimeout, wTimeout time.Duration) {
 
 type config struct {
 	TorProxy           string   `yaml:"tor-proxy"`
+	VPNInterfaces      []string `yaml:"vpn-interfaces"`
 	UpstreamResolvers  []string `yaml:"upstream-resolvers"`
 	PathsPerQuery      int      `yaml:"paths-per-query"`
 	DNSAddr            string   `yaml:"dns-addr"`
 	DNSReadTimeout     string   `yaml:"dns-read-timeout"`
 	DNSWriteTimeout    string   `yaml:"dns-write-timeout"`
-	DNSNetwork         string   `yaml:"dns-network"`
+	DNSListenNetwork   string   `yaml:"dns-listen-network"`
+	DNSQueryNetwork    string   `yaml:"dns-query-network"`
 	MajorityDefinition float64  `yaml:"majority-definition"`
-	Mode               string   `yaml:"mode"`
+	DNSMode            string   `yaml:"dns-mode"`
+	ForwardingMode     string   `yaml:"forwarding-mode"`
 }
 
 func main() {
@@ -238,15 +253,53 @@ func main() {
 	if c.MajorityDefinition > 0 {
 		majorityDef = c.MajorityDefinition
 	}
+	if c.DNSListenNetwork == "" {
+		c.DNSListenNetwork = "udp"
+	}
+	if c.DNSQueryNetwork == "" {
+		c.DNSQueryNetwork = "tcp"
+	}
 
 	t := &tdns{
-		dialer:    &net.Dialer{Timeout: 10 * time.Second},
-		proxy:     c.TorProxy,
-		upstreams: c.UpstreamResolvers,
-		paths:     c.PathsPerQuery,
-		majority:  majority(c.PathsPerQuery),
+		stdDialer:    &net.Dialer{Timeout: 10 * time.Second},
+		paths:        c.PathsPerQuery,
+		majority:     majority(c.PathsPerQuery),
+		dnsQueryMode: c.DNSQueryNetwork,
 	}
-	switch c.Mode {
+	switch c.ForwardingMode {
+	case "tor":
+		t.dialerFunc = t.torDialer
+		t.torProxy = c.TorProxy
+		t.upstreams = c.UpstreamResolvers
+		if c.DNSQueryNetwork != "tcp" {
+			fmt.Fprintln(os.Stderr, "In 'tor' mode only TCP DNS forwarding is supported")
+			os.Exit(1)
+		}
+	case "vpn":
+		t.dialerFunc = t.vpnDialer
+		if len(c.VPNInterfaces) < c.PathsPerQuery {
+			fmt.Fprintf(os.Stderr, "Cannot construct %d paths using %d interfaces\n", c.PathsPerQuery, len(c.VPNInterfaces))
+			os.Exit(1)
+		}
+		for _, i := range c.VPNInterfaces {
+			inter, err := net.InterfaceByName(i)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to find interface '%s': %s\n", i, err)
+				os.Exit(1)
+			}
+			addrs, err := inter.Addrs()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to get interface addresses for '%s': %s\n", i, err)
+				os.Exit(1)
+			}
+			t.vpnAddrs = append(t.vpnAddrs, addrs[0])
+		}
+		t.vpnAddrs = []net.Addr{}
+	default:
+		fmt.Fprintln(os.Stderr, "forwarding-mode must be set to either 'tor' or 'vpn'")
+		os.Exit(1)
+	}
+	switch c.DNSMode {
 	case "", "strict":
 		t.combiner = t.strictCheck
 	case "merge":
@@ -271,8 +324,5 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	if c.DNSNetwork == "" {
-		c.DNSNetwork = "udp"
-	}
-	t.serve(c.DNSAddr, c.DNSNetwork, dnsRTimeout, dnsWTimeout)
+	t.serve(c.DNSAddr, c.DNSListenNetwork, dnsRTimeout, dnsWTimeout)
 }
