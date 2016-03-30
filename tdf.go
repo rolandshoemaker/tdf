@@ -127,7 +127,7 @@ func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 	ret, err := t.combiner(results)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[%X] response check failed: %s\n", id, err)
-		ret := new(dns.Msg)
+		ret = new(dns.Msg)
 		ret.SetReply(r)
 		ret.Rcode = dns.RcodeServerFailure
 		err = w.WriteMsg(ret)
@@ -147,9 +147,6 @@ func (t *tdns) dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 func (t *tdns) mergeCheck(msgs []*dns.Msg) (*dns.Msg, error) {
 	ret := new(dns.Msg)
 	rcodes := make(map[int]int)
-	answer := []dns.RR{}
-	ns := []dns.RR{}
-	extra := []dns.RR{}
 	failed := 0
 	for _, m := range msgs {
 		if m == nil {
@@ -157,11 +154,8 @@ func (t *tdns) mergeCheck(msgs []*dns.Msg) (*dns.Msg, error) {
 			continue
 		}
 		rcodes[m.Rcode]++
-		answer = append(answer, m.Answer...)
-		ns = append(ns, m.Ns...)
-		extra = append(extra, m.Extra...)
 	}
-	if failed > t.majority {
+	if failed > (t.paths - t.majority) {
 		return nil, fmt.Errorf("%d queries failed or timed out (%d required to continue)", failed, t.majority)
 	}
 	li := 0
@@ -170,12 +164,27 @@ func (t *tdns) mergeCheck(msgs []*dns.Msg) (*dns.Msg, error) {
 			li = i
 		}
 	}
-	ret.Rcode = li
-	if ret.Rcode == dns.RcodeSuccess {
-		ret.Answer = dns.Dedup(answer, nil)
-		ret.Ns = dns.Dedup(ns, nil)
-		ret.Extra = dns.Dedup(extra, nil)
+	if rcodes[li] < t.majority {
+		return nil, fmt.Errorf("did not get consensus, %d different return codes from %d queries", len(rcodes), t.paths)
 	}
+	ret.Rcode = li
+	if ret.Rcode != dns.RcodeSuccess {
+		return ret, nil
+	}
+	answer := []dns.RR{}
+	ns := []dns.RR{}
+	extra := []dns.RR{}
+	for _, m := range msgs {
+		if m == nil || m.Rcode != ret.Rcode {
+			continue // don't merge records from bad responses...
+		}
+		answer = append(answer, m.Answer...)
+		ns = append(ns, m.Ns...)
+		extra = append(extra, m.Extra...)
+	}
+	ret.Answer = dns.Dedup(answer, nil)
+	ret.Ns = dns.Dedup(ns, nil)
+	ret.Extra = dns.Dedup(extra, nil)
 	return ret, nil
 }
 
@@ -258,6 +267,10 @@ func main() {
 	}
 	if c.DNSQueryNetwork == "" {
 		c.DNSQueryNetwork = "tcp"
+	}
+	if c.PathsPerQuery <= 0 {
+		fmt.Fprintln(os.Stderr, "paths-per-query must be > 0")
+		os.Exit(1)
 	}
 
 	t := &tdns{
